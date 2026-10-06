@@ -1,97 +1,84 @@
-# infra-monitor
+# CivicLens
 
-AI-Powered Public Infrastructure Monitoring System with FastAPI backend and Vite + React + Tailwind frontend.
+CivicLens is a public infrastructure monitoring platform built for Indore. Citizens upload a photo of a road or street problem, a YOLO model detects it, and the system scores its priority and tracks it until it is fixed and verified.
 
-## Project Architecture & Tech Stack
-- **Backend**: Python 3.10+, FastAPI, SQLAlchemy, SQLite, Pydantic v2, Uvicorn
-- **Frontend**: React, Vite, React Router DOM, Tailwind CSS, Leaflet / React-Leaflet, Recharts, Lucide Icons, Axios
+## What it does
 
----
+- Detects potholes, road cracks, garbage, drains and broken streetlights from a photo
+- Gives each issue a priority score from 0 to 100 with a visible breakdown of why
+- Merges reports of the same problem within 20 meters into one ticket with a report count
+- Sets a repair deadline from the priority and flags overdue tickets
+- Verifies a fix: staff upload an after photo and the model checks the problem is gone
+- Allows reopening a ticket, and flags a new issue near a spot repaired in the last 90 days as a repeat repair
+- Generates a complaint letter addressed to the correct department
+- Shows issues on a map, in a filterable queue, and in an analytics page
 
-## Directory Structure
+## How the AI model works
+
+The detector is a YOLO model (Ultralytics) trained on a Roboflow dataset for 50 epochs in Google Colab. The app calls it through one function, `detect(image_path)`, in `backend/app/services/detector.py`, so the model can be replaced without changing anything else.
+
+- Classes used by the app: pothole, road cracks (and corrugation), garbage, drains and manholes, and streetlights that are off
+- Classes ignored because they are not problems: closed manholes, non-garbage, working bulbs, and the streetlight pole
+- Confidence threshold: 0.25
+- Strongest on potholes, cracks and garbage. Weaker on drains because the dataset has fewer examples.
+- Dataset and Results: Combined infrastructure-monitoring dataset collected from Roboflow Universe, consisting of pothole, road crack/damage, and drainage/overflow images. 4522 images and A mAP 50 score of 0.628
+
+## Priority score
+
+score = type weight x 0.35 + size in photo x 0.25 + detection confidence x 0.10 + location risk x 0.15 + report count x 0.15
+
+The result is shown from 0 to 100. High is above 65, Medium above 40, otherwise Low. Location risk is a placeholder for now.
+
+## Model weights
+
+The trained file `best.pt` is stored in this repository. 
+
+## Tech stack
+
+- Backend: Python, FastAPI, SQLAlchemy, SQLite, Pydantic, Pillow
+- AI: YOLO (Ultralytics), Roboflow, Google Colab
+- Frontend: React (Vite), Tailwind CSS, React Router, Leaflet, Recharts, lucide-react
+- Maps and addresses: OpenStreetMap, Nominatim
+
+## How to run
+
+Backend:
+
 ```
-infra-monitor/
-├── PROJECT_SPEC.md
-├── README.md
-├── backend/
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── database.py
-│   │   ├── models.py
-│   │   ├── schemas.py
-│   │   ├── routers/
-│   │   │   ├── reports.py
-│   │   │   ├── issues.py
-│   │   │   └── stats.py
-│   │   └── services/
-│   │       ├── detector.py       # Standardized detector contract [detect(image_path)]
-│   │       ├── scoring.py        # Explainable priority calculation engine
-│   │       ├── duplicates.py     # Geospatial duplicate issue aggregator
-│   │       ├── complaint.py      # Municipal complaint text generator
-│   │       └── verification.py   # AI verification service
-│   ├── uploads/                  # Static file storage
-│   ├── seed.py                   # DB Seed script
-│   └── requirements.txt
-└── frontend/
-    ├── src/
-    │   ├── api.js
-    │   ├── App.jsx
-    │   ├── index.css
-    │   └── components/
-    │       ├── Navbar.jsx
-    │       ├── Overview.jsx
-    │       ├── CitizenReport.jsx
-    │       ├── IssueMap.jsx
-    │       ├── IssueQueue.jsx
-    │       └── Analytics.jsx
-    ├── package.json
-    ├── tailwind.config.js
-    └── vite.config.js
-```
-
----
-
-## AI Detector Contract
-Located at `backend/app/services/detector.py`:
-```python
-def detect(image_path: str) -> list[dict]:
-    """
-    Contract: returns list[{"type": str, "confidence": float, "bbox": [x1, y1, x2, y2]}]
-    """
-```
-Currently implemented as a stub returning fake pothole detections, ready to be replaced with a YOLO / PyTorch model.
-
----
-
-## How to Run
-
-Both backend and frontend can be started with **one command each**:
-
-### 1. Start the Backend API Server
-In a terminal, navigate to the `backend` directory:
-```bash
 cd backend
 pip install -r requirements.txt
 python seed.py
 uvicorn app.main:app --reload --port 8000
 ```
-- API Docs will be available at: [http://localhost:8000/docs](http://localhost:8000/docs)
-- Static files served under `/uploads`
 
-### 2. Start the Frontend App
-In a separate terminal, navigate to the `frontend` directory:
-```bash
+API docs: http://localhost:8000/docs
+
+Frontend, in a second terminal:
+
+```
 cd frontend
 npm install
 npm run dev
 ```
-- Frontend application will be live at: [http://localhost:5173](http://localhost:5173)
 
----
+App: http://localhost:5173
 
-## Verification & Features
-1. **Citizen Incident Reporting**: Upload photos of potholes, road damage, garbage, or broken streetlights with GPS coords.
-2. **Explainable Priority Scoring**: Dynamic 0-100 score with full textual breakdown.
-3. **Geospatial Leaflet Mapping**: View issues as markers or intensity radius circles.
-4. **Authority Queue & Complaint Generator**: Update issue status (Open, In Progress, Resolved) and generate municipal complaints.
-5. **Recharts Analytics Dashboard**: Category and status breakdowns.
+## Demo data
+
+`python seed.py` adds sample issues marked as demo data. Remove them with `python clear_demo.py`.
+
+## Limits of this version
+
+- Early model checkpoint, with weaker drain detection
+- No login or user roles
+- No spam protection or photo location check
+- SQLite for the prototype. A larger deployment would use PostgreSQL with PostGIS, cloud image storage, and a background job queue.
+
+## Team
+
+Akshat Joshi: Web application
+Aditi Sharma: Model training
+
+## License
+
+AGPL-3.0. See the LICENSE file.
