@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Secrets and config
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Uploaded and generated images
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Training data and runs
+datasets/
+runs/
+*.zip
+last.pt
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Agent scratch and logs
+*.log
+.gemini/
+
+Test photo/
+backend/best.pt
+backend/test.jpeg
+*.pt
