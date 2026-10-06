@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # best.pt lives in backend/ (same location as before)
-MODEL_PATH = Path(__file__).resolve().parents[2] / "best(5).pt"
+MODEL_PATH = Path(__file__).resolve().parents[2] / "best (5).pt"
 CONF_THRESHOLD = 0.25
 
 # Vision-LLM fallback: used when YOLO finds nothing, or its best box is below this confidence.
