@@ -1,20 +1,26 @@
-import os
 import logging
-import traceback
+import math
+import os
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Absolute path to model in backend folder
+# best.pt lives in backend/ (same location as before)
 MODEL_PATH = Path(__file__).resolve().parents[2] / "best.pt"
 CONF_THRESHOLD = 0.25
+
+# Vision-LLM fallback: used when YOLO finds nothing, or its best box is below this confidence.
+VLM_MIN_CONF = float(os.getenv("VLM_MIN_CONF", "0.5"))
+
 
 def normalize(name: str) -> str:
     if not name:
         return ""
     return str(name).strip().lower().replace("(", "-").replace(")", "-")
 
+
+# ---- YOLO class name -> app issue type (unchanged from your previous file) ----
 RAW_CLASS_MAP = {
     "pothole": "pothole",
     "road_cracks": "crack",
@@ -24,171 +30,150 @@ RAW_CLASS_MAP = {
     "open drainage(overflowing)": "drain",
     "open drainage(not overflowing)": "drain",
     "open manhole(not overflowing)": "drain",
-    "off_bulb": "streetlight"
+    "off_bulb": "streetlight",
 }
 
 RAW_IGNORED_CLASSES = {
     "closed manhole(not overflowing)",
     "non-garbage",
     "on_bulb",
-    "street_light"
+    "street_light",
 }
 
 CLASS_MAP = {normalize(k): v for k, v in RAW_CLASS_MAP.items()}
 IGNORED_CLASSES = {normalize(k) for k in RAW_IGNORED_CLASSES}
 
-_cached_model = None
-_active_mode: Optional[str] = None
-_mode_reason: Optional[str] = None
+# ---- Vision-LLM class name -> app issue type ----
+VLM_TO_TYPE = {
+    "pothole": "pothole",
+    "road_crack": "crack",
+    "garbage_overflow": "garbage",
+    "drain_overflow": "drain",
+    "broken_streetlight": "streetlight",
+}
+
+_model = None
 
 
-def _init_detector() -> Tuple[Optional[object], str]:
-    global _cached_model, _active_mode, _mode_reason
+def _load_model():
+    """Load the YOLO model once. Raises a clear error if best.pt is missing."""
+    global _model
+    if _model is not None:
+        return _model
 
-    if _active_mode is not None:
-        return _cached_model, _active_mode
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Model file not found at {MODEL_PATH}. Put best.pt in the backend/ folder.")
 
-    mode_env = os.getenv("DETECTOR_MODE", "auto").lower().strip()
+    from ultralytics import YOLO
 
-    if mode_env == "stub":
-        _active_mode = "stub"
-        _mode_reason = "DETECTOR_MODE set to stub"
-        logger.info("Detector mode: stub, reason: %s", _mode_reason)
-        print(f"Detector mode: stub, reason: {_mode_reason}")
-        return None, "stub"
+    _model = YOLO(str(MODEL_PATH))
 
-    if mode_env == "real" or (mode_env == "auto" and MODEL_PATH.exists()):
-        if not MODEL_PATH.exists():
-            err_msg = f"DETECTOR_MODE is 'real' but model file does not exist at {MODEL_PATH}"
-            logger.error(err_msg)
-            raise FileNotFoundError(err_msg)
-
-        try:
-            from ultralytics import YOLO
-            model = YOLO(str(MODEL_PATH))
-            _cached_model = model
-            _active_mode = "real"
-
-            names = model.names
-            if isinstance(names, dict):
-                class_names = [names[i] for i in sorted(names.keys())]
-            else:
-                class_names = list(names)
-
-            logger.info("Detector mode: real, model: %s, classes: %s", MODEL_PATH, class_names)
-            print(f"Detector mode: real, model: {MODEL_PATH}, classes: {class_names}")
-
-            mapped_list = []
-            ignored_list = []
-            unknown_list = []
-
-            for cls_name in class_names:
-                norm = normalize(cls_name)
-                if norm in IGNORED_CLASSES:
-                    ignored_list.append(cls_name)
-                elif norm in CLASS_MAP:
-                    mapped_list.append(f"{cls_name} -> {CLASS_MAP[norm]}")
-                else:
-                    unknown_list.append(cls_name)
-
-            logger.info("Mapped classes: %s", mapped_list)
-            logger.info("Ignored classes: %s", ignored_list)
-            logger.info("Unknown classes: %s", unknown_list)
-            print(f"Mapped classes: {mapped_list}")
-            print(f"Ignored classes: {ignored_list}")
-            print(f"Unknown classes: {unknown_list}")
-
-            return _cached_model, "real"
-        except Exception as e:
-            logger.error("Failed to load ultralytics YOLO model from %s:\n%s", MODEL_PATH, traceback.format_exc(), exc_info=True)
-            raise e
-
-    # auto mode when MODEL_PATH does not exist
-    _active_mode = "stub"
-    _mode_reason = f"model file best.pt not found at {MODEL_PATH}"
-    logger.info("Detector mode: stub, reason: %s", _mode_reason)
-    print(f"Detector mode: stub, reason: {_mode_reason}")
-    return None, "stub"
+    names = _model.names
+    class_names = [names[i] for i in sorted(names)] if isinstance(names, dict) else list(names)
+    mapped, ignored, unknown = [], [], []
+    for n in class_names:
+        norm = normalize(n)
+        if norm in IGNORED_CLASSES:
+            ignored.append(n)
+        elif norm in CLASS_MAP:
+            mapped.append(f"{n} -> {CLASS_MAP[norm]}")
+        else:
+            unknown.append(n)
+    logger.info("Detector loaded: %s", MODEL_PATH)
+    logger.info("Mapped classes: %s", mapped)
+    logger.info("Ignored classes: %s", ignored)
+    logger.info("Unknown classes (dropped): %s", unknown)
+    return _model
 
 
 def get_detector_source() -> str:
-    """Returns 'real' or 'stub' for the mode that is actually active."""
-    _, mode = _init_detector()
-    return mode
+    """Kept for compatibility with callers. The stub is gone, so this is always 'real'."""
+    _load_model()
+    return "real"
+
+
+def _vlm_enabled() -> bool:
+    if os.getenv("VLM_FALLBACK", "on").lower().strip() == "off":
+        return False
+    return bool(os.getenv("ANTHROPIC_API_KEY"))
+
+
+def _image_size(image_path: str):
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as img:
+            return img.size
+    except Exception:
+        return 640, 480
+
+
+def _yolo_detect(model, image_path: str) -> List[Dict]:
+    detections = []
+    names = model.names
+    for result in model(image_path, conf=CONF_THRESHOLD, verbose=False):
+        if result.boxes is None:
+            continue
+        for box in result.boxes:
+            norm_name = normalize(names[int(box.cls[0])])
+            if norm_name in IGNORED_CLASSES or norm_name not in CLASS_MAP:
+                continue
+            detections.append({
+                "type": CLASS_MAP[norm_name],
+                "confidence": round(float(box.conf[0]), 2),
+                "bbox": [int(round(c)) for c in box.xyxy[0].tolist()],
+                "source": "yolo",
+            })
+    return detections
+
+
+def _estimated_bbox(w: int, h: int, area_frac: float) -> List[int]:
+    """The LLM gives no pixel box. Build a centred box covering ~area_frac of the image so
+    scoring (which uses bbox area) keeps working. Mark it as estimated for the UI."""
+    s = math.sqrt(max(min(area_frac, 1.0), 0.001))
+    bw, bh = w * s, h * s
+    x1, y1 = (w - bw) / 2, (h - bh) / 2
+    return [int(x1), int(y1), int(x1 + bw), int(y1 + bh)]
+
+
+def _vlm_detect(image_path: str, have_types: set) -> List[Dict]:
+    from app.services.vision_fallback import vlm_detect
+
+    with open(image_path, "rb") as f:
+        raw = f.read()
+    w, h = _image_size(image_path)
+
+    out = []
+    for d in vlm_detect(raw):
+        t = VLM_TO_TYPE.get(d["class"])
+        if not t or t in have_types:  # don't duplicate something YOLO already found
+            continue
+        out.append({
+            "type": t,
+            "confidence": d["confidence"],
+            "bbox": _estimated_bbox(w, h, d["area_frac"]),
+            "source": "vlm",
+            "bbox_estimated": True,
+            "note": d.get("note", ""),
+        })
+    return out
 
 
 def detect(image_path: str) -> List[Dict]:
     """
     Detector contract:
-    detect(image_path) -> list[{"type": str, "confidence": float, "bbox": [x1, y1, x2, y2]}]
+    detect(image_path) -> list[{"type": str, "confidence": float, "bbox": [x1, y1, x2, y2], ...}]
+    Extra keys: "source" ('yolo' | 'vlm'); VLM items also have "bbox_estimated" and "note".
     """
-    model, mode = _init_detector()
+    model = _load_model()
+    detections = _yolo_detect(model, image_path)
 
-    if mode == "real" and model is not None:
-        results = model(image_path, conf=CONF_THRESHOLD)
-        detections = []
-        names = model.names
+    weak = not detections or max(d["confidence"] for d in detections) < VLM_MIN_CONF
+    if weak and _vlm_enabled():
+        try:
+            detections += _vlm_detect(image_path, {d["type"] for d in detections})
+        except Exception:
+            logger.exception("VLM fallback failed for %s; returning YOLO results only", image_path)
 
-        for result in results:
-            boxes = result.boxes
-            if boxes is None:
-                continue
-            for box in boxes:
-                conf_val = float(box.conf[0])
-                cls_id = int(box.cls[0])
-                raw_cls_name = names[cls_id] if isinstance(names, dict) else names[cls_id]
-                norm_name = normalize(raw_cls_name)
-
-                if norm_name in IGNORED_CLASSES or norm_name not in CLASS_MAP:
-                    continue
-
-                mapped_type = CLASS_MAP[norm_name]
-                xyxy = box.xyxy[0].tolist()
-                bbox = [int(round(c)) for c in xyxy]
-
-                detections.append({
-                    "type": mapped_type,
-                    "confidence": round(conf_val, 2),
-                    "bbox": bbox
-                })
-
-        detections.sort(key=lambda x: x["confidence"], reverse=True)
-        return detections
-
-    # Stub mode implementation
-    fn_lower = Path(image_path).name.lower()
-    if any(keyword in fn_lower for keyword in ("clean", "fixed", "after")):
-        return []
-
-    # Determine defect type from filename or default to pothole
-    defect_type = "pothole"
-    for candidate in ("pothole", "crack", "drain", "garbage", "streetlight"):
-        if candidate in fn_lower:
-            defect_type = candidate
-            break
-
-    # Deterministic confidence between 0.55 and 0.92 based on filename hash
-    hash_val = sum(ord(c) for c in fn_lower)
-    confidence = round(0.55 + (hash_val % 38) * 0.01, 2)
-
-    # Calculate bbox covering 8 to 30% of original image dimensions using PIL
-    try:
-        from PIL import Image
-        with Image.open(image_path) as img:
-            w, h = img.size
-    except Exception:
-        w, h = 640, 480
-
-    x1 = int(w * 0.20)
-    y1 = int(h * 0.20)
-    x2 = int(w * 0.65)
-    y2 = int(h * 0.65)
-    bbox = [x1, y1, x2, y2]
-
-    return [
-        {
-            "type": defect_type,
-            "confidence": confidence,
-            "bbox": bbox
-        }
-    ]
+    detections.sort(key=lambda x: x["confidence"], reverse=True)
+    return detections
